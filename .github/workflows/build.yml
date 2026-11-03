@@ -4,14 +4,13 @@ name: Build X-WRT for Routerich AX3000-V1 (+ optional others)
 #   X-WRT fork adaptation (4tomson/x-wrt)
 #   1. base_repo: 4tomson (fork, default) / x-wrt (upstream fallback)
 #   2. USB 3.0 fix patch (117-complete-mt7981b-dtsi.patch) НЕ ПРИМЕНЯЕТСЯ
-#      — убран по требованию, X-WRT собирается со своими DTS как есть.
-#   3. Профили устройств: WARN вместо ERROR (X-WRT дерево может не иметь
-#      всех 4 профилей из ImmortalWrt-базы). Диагностика выводит список
-#      доступных routerich/netis/xiaomi профилей в filogic.mk.
+#   3. Профили устройств: WARN вместо ERROR; диагностика доступных профилей
 #   4. Re:HomeProxy AutoMod (ezdizzy) — из исходников в package/
 #   5. AmneziaWG: внешний feed awgopenwrt, 3 попытки сборки
 #   6. Артефакты: ищутся и *.apk, и *.ipk (X-WRT часто на opkg)
 #   7. libgcc-fix и mtwifi-cfg-ucode-патч — только если файлы существуют
+#   8. apply_mtk_patches: опциональное применение mtk-openwrt-feeds (mtwifi/warp/hnat)
+#      с логированием конфликтов в mtk-patch-log артефакт. По умолчанию OFF.
 # ────────────────────────────────────────────────────────────────────
 
 on:
@@ -40,6 +39,10 @@ on:
           - ubuntu-22.04
       build_amneziawg_only:
         description: 'Собрать ТОЛЬКО AmneziaWG-пакеты (без прошивки)'
+        type: boolean
+        default: false
+      apply_mtk_patches:
+        description: 'Применить проприетарные патчи MTK (mtwifi/warp/hnat)?'
         type: boolean
         default: false
       force_clean:
@@ -113,9 +116,9 @@ jobs:
           else
             REPO="https://github.com/x-wrt/x-wrt.git"
           fi
-          echo "BASE=$BASE"    >> $GITHUB_ENV
-          echo "REPO=$REPO"    >> $GITHUB_ENV
-          echo "BRANCH=$BRANCH" >> $GITHUB_ENV
+          echo "BASE=$BASE"      >> $GITHUB_ENV
+          echo "REPO=$REPO"      >> $GITHUB_ENV
+          echo "BRANCH=$BRANCH"  >> $GITHUB_ENV
           echo "Selected base: $BASE ($REPO, branch: $BRANCH)"
 
           # Защита от cross-fork contamination
@@ -166,6 +169,14 @@ jobs:
             echo "src-git awgopenwrt https://github.com/this-username-has-been-taken/amneziawg-openwrt.git" >> feeds.conf.default
           fi
 
+          # MTK proprietary feed (mtwifi/warp/hnat) — только если включён apply_mtk_patches
+          if [ "${{ inputs.apply_mtk_patches }}" == "true" ]; then
+            if ! grep -q "mtk_openwrt_feed" feeds.conf.default; then
+              echo "src-git mtk_openwrt_feed https://github.com/mediatek/mtk-openwrt-feeds.git" >> feeds.conf.default
+            fi
+            echo "OK: mtk_openwrt_feed added to feeds.conf.default"
+          fi
+
           ./scripts/feeds update -a
           ./scripts/feeds install -a
 
@@ -203,7 +214,7 @@ jobs:
             echo "INFO: no po/ in fork (i18n may be English-only)"
           fi
 
-          # Убираем штатный homeproxy из фидов (если есть)
+          # Убираем штатный homeproxy из фидов
           rm -f package/feeds/luci/luci-app-re-homeproxy 2>/dev/null || true
           rm -f package/feeds/luci/luci-app-re-homeproxy-hiddify 2>/dev/null || true
           rm -f package/feeds/luci/luci-i18n-homeproxy-* 2>/dev/null || true
@@ -274,6 +285,82 @@ jobs:
           rm -rf staging_dir toolchain
           echo "OK: toolchain clean"
 
+      - name: Apply MTK proprietary patches
+        if: ${{ inputs.apply_mtk_patches }}
+        continue-on-error: true
+        run: |
+          cd openwrt
+          FEED_DIR="feeds/mtk_openwrt_feed/autobuild/unified/filogic/25.12"
+          PATCH_LOG="$GITHUB_WORKSPACE/mtk-patch-conflicts.log"
+          : > "$PATCH_LOG"
+
+          echo "=== MTK feed dir: $FEED_DIR ==="
+          if [ ! -d "$FEED_DIR" ]; then
+            echo "ERROR: MTK feed dir missing: $FEED_DIR"
+            echo "--- feeds/ top-level ---"
+            ls -la feeds/ 2>/dev/null || true
+            echo "--- mtk_openwrt_feed content ---"
+            find feeds/mtk_openwrt_feed -maxdepth 3 -type d 2>/dev/null | head -40 || true
+            echo "MTK feed not cloned properly — check feeds.conf.default and network" | tee -a "$PATCH_LOG"
+            exit 1
+          fi
+
+          echo ""
+          echo "=== Copy MTK files (DTS, configs) ==="
+          if [ -d "$FEED_DIR/files" ]; then
+            cp -av "$FEED_DIR/files/." ./ 2>&1 | tee -a "$PATCH_LOG"
+          else
+            echo "INFO: no files/ dir in $FEED_DIR"
+          fi
+
+          echo ""
+          echo "=== Apply patches-base ==="
+          if [ -d "$FEED_DIR/patches-base" ]; then
+            while read -r p; do
+              echo "--- $(basename "$p")"
+              if ! patch -N -p1 -f -i "$p" >> "$PATCH_LOG" 2>&1; then
+                echo "CONFLICT: $p" | tee -a "$PATCH_LOG"
+                patch -p1 --dry-run -f -i "$p" 2>&1 | head -40 >> "$PATCH_LOG" || true
+              fi
+            done < <(find "$FEED_DIR/patches-base" -name "*.patch" | sort)
+          else
+            echo "INFO: no patches-base in $FEED_DIR"
+          fi
+
+          echo ""
+          echo "=== Apply patches-feeds ==="
+          if [ -d "$FEED_DIR/patches-feeds" ]; then
+            while read -r p; do
+              echo "--- $(basename "$p")"
+              if ! patch -N -p1 -f -i "$p" >> "$PATCH_LOG" 2>&1; then
+                echo "CONFLICT (feeds): $p" | tee -a "$PATCH_LOG"
+                patch -p1 --dry-run -f -i "$p" 2>&1 | head -40 >> "$PATCH_LOG" || true
+              fi
+            done < <(find "$FEED_DIR/patches-feeds" -name "*.patch" | sort)
+          else
+            echo "INFO: no patches-feeds for 25.12"
+          fi
+
+          REJ=$(find . -name "*.rej" 2>/dev/null | wc -l)
+          echo ""
+          echo "=== Total .rej files: $REJ ==="
+          if [ "$REJ" -gt 0 ]; then
+            echo "WARN: $REJ conflicts — see artifact: mtk-patch-log"
+            find . -name "*.rej" 2>/dev/null >> "$PATCH_LOG"
+          else
+            echo "OK: All patches applied cleanly"
+          fi
+
+      - name: Upload MTK patch log
+        if: ${{ always() && inputs.apply_mtk_patches }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: mtk-patch-log
+          path: |
+            mtk-patch-conflicts.log
+            openwrt/**/*.rej
+          if-no-files-found: warn
+
       - name: Patch filogic.mk (remove mainline mt76 Wi-Fi from all 4 devices)
         run: |
           cd openwrt
@@ -306,7 +393,7 @@ jobs:
           done
           if [ -n "$MISSING" ]; then
             echo ""
-            echo "⚠️  Missing profiles:$MISSING"
+            echo "WARN: Missing profiles:$MISSING"
             echo "   Соответствующие CONFIG_TARGET_DEVICE_* будут молча отброшены make defconfig."
             echo "   Проверьте вывод шага 'Diagnose Available Profiles'."
           fi
@@ -523,6 +610,7 @@ jobs:
             VERMAGIC="kmod not built"
           fi
           HOMEPROXY_VER=$(cd package/luci-app-re-homeproxy 2>/dev/null && git describe --tags --always 2>/dev/null || echo "unknown")
+          MTK_MODE="${{ inputs.apply_mtk_patches && 'mtwifi + MTK patches' || 'mt76 (open)' }}"
           cat > build-info.txt <<EOF
           X-WRT build info
           =================
@@ -533,8 +621,8 @@ jobs:
           Vermagic:  ${VERMAGIC}
           Built at:  $(date -u +%Y-%m-%dT%H:%M:%SZ)
           Mode:      ${{ inputs.build_amneziawg_only && 'AmneziaWG only' || 'Full firmware' }}
+          Wi-Fi:     ${MTK_MODE}
           HomeProxy: ${HOMEPROXY_VER}
-          Wi-Fi:     mtwifi (proprietary MTK)
 
           Post-flash notes
           ================
@@ -555,6 +643,9 @@ jobs:
 
           5. Xiaomi AX3000T — только ранние ревизии на MT7981 (RD03 V1).
              НЕ прошивать на Qualcomm-ревизиях!
+
+          6. Если Wi-Fi = mtwifi + MTK patches: см. mtk-patch-log артефакт
+             (могут быть .rej файлы, требующие ручной доработки).
           EOF
           echo "=== build-info.txt ==="
           cat build-info.txt

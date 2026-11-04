@@ -9,8 +9,9 @@ name: Build X-WRT for Routerich AX3000-V1 (+ optional others)
 #   5. AmneziaWG: внешний feed awgopenwrt, 3 попытки сборки
 #   6. Артефакты: ищутся и *.apk, и *.ipk (X-WRT часто на opkg)
 #   7. libgcc-fix и mtwifi-cfg-ucode-патч — только если файлы существуют
-#   8. apply_mtk_patches: опциональное применение mtk-openwrt-feeds (mtwifi/warp/hnat)
-#      с логированием конфликтов в mtk-patch-log артефакт. По умолчанию OFF.
+#   8. apply_mtk_patches: применение mtk-openwrt-feeds (mtwifi/warp/hnat)
+#      Пути исправлены на официальные: feeds/mtk_openwrt_feed/25.12/...
+#      Логика патчей не падает при конфликтах (собирает .rej в лог).
 # ────────────────────────────────────────────────────────────────────
 
 on:
@@ -290,62 +291,71 @@ jobs:
         continue-on-error: true
         run: |
           cd openwrt
-          FEED_DIR="feeds/mtk_openwrt_feed/autobuild/unified/filogic/25.12"
+          FEED_DIR="feeds/mtk_openwrt_feed"
+          VER="25.12"
           PATCH_LOG="$GITHUB_WORKSPACE/mtk-patch-conflicts.log"
           : > "$PATCH_LOG"
 
-          echo "=== MTK feed dir: $FEED_DIR ==="
-          if [ ! -d "$FEED_DIR" ]; then
-            echo "ERROR: MTK feed dir missing: $FEED_DIR"
-            echo "--- feeds/ top-level ---"
-            ls -la feeds/ 2>/dev/null || true
-            echo "--- mtk_openwrt_feed content ---"
-            find feeds/mtk_openwrt_feed -maxdepth 3 -type d 2>/dev/null | head -40 || true
-            echo "MTK feed not cloned properly — check feeds.conf.default and network" | tee -a "$PATCH_LOG"
+          # Официальные пути к файлам и патчам
+          FILES_SRC="$FEED_DIR/$VER/files"
+          PBASE_SRC="$FEED_DIR/$VER/patches-base"
+          PFEED_SRC="$FEED_DIR/$VER/patches-feeds"
+
+          echo "=== MTK paths ==="
+          echo "  files:         $FILES_SRC"
+          echo "  patches-base:  $PBASE_SRC"
+          echo "  patches-feeds: $PFEED_SRC"
+
+          if [ ! -d "$FILES_SRC" ]; then
+            echo "ERROR: $FILES_SRC missing"
+            ls -la "$FEED_DIR/$VER/" 2>/dev/null || true
             exit 1
           fi
 
+          # Бэкап Config.in (на случай если профили отвалятся)
+          echo "=== Backup Config.in ==="
+          cp -v target/linux/mediatek/image/Config.in /tmp/xwrt-Config.in.bak
+
           echo ""
-          echo "=== Copy MTK files (DTS, configs) ==="
-          if [ -d "$FEED_DIR/files" ]; then
-            cp -av "$FEED_DIR/files/." ./ 2>&1 | tee -a "$PATCH_LOG"
-          else
-            echo "INFO: no files/ dir in $FEED_DIR"
-          fi
+          echo "=== Copy MTK files ==="
+          cp -af "$FILES_SRC/." . 2>&1 | tee -a "$PATCH_LOG"
+
+          # Функция применения патчей
+          apply_patches() {
+            local src="$1" tag="$2"
+            if [ ! -d "$src" ]; then
+              echo "INFO: no $src"
+              return 0
+            fi
+            local total=0 fails=0
+            while read -r p; do
+              total=$((total+1))
+              echo "--- $(basename "$p")"
+              if ! patch -f -p1 -i "$p" >> "$PATCH_LOG" 2>&1; then
+                fails=$((fails+1))
+                echo "CONFLICT ($tag): $(basename "$p")" | tee -a "$PATCH_LOG"
+                patch -p1 --dry-run -f -i "$p" 2>&1 | head -30 >> "$PATCH_LOG" || true
+              fi
+            done < <(find "$src" -name "*.patch" | sort)
+            echo "=== $tag summary: $total total, $fails failed ==="
+            if [ "$fails" -gt 0 ]; then
+              echo "$tag had $fails failed patches" >> "$PATCH_LOG"
+            fi
+          }
 
           echo ""
           echo "=== Apply patches-base ==="
-          if [ -d "$FEED_DIR/patches-base" ]; then
-            while read -r p; do
-              echo "--- $(basename "$p")"
-              if ! patch -N -p1 -f -i "$p" >> "$PATCH_LOG" 2>&1; then
-                echo "CONFLICT: $p" | tee -a "$PATCH_LOG"
-                patch -p1 --dry-run -f -i "$p" 2>&1 | head -40 >> "$PATCH_LOG" || true
-              fi
-            done < <(find "$FEED_DIR/patches-base" -name "*.patch" | sort)
-          else
-            echo "INFO: no patches-base in $FEED_DIR"
-          fi
+          apply_patches "$PBASE_SRC" "patches-base"
 
           echo ""
           echo "=== Apply patches-feeds ==="
-          if [ -d "$FEED_DIR/patches-feeds" ]; then
-            while read -r p; do
-              echo "--- $(basename "$p")"
-              if ! patch -N -p1 -f -i "$p" >> "$PATCH_LOG" 2>&1; then
-                echo "CONFLICT (feeds): $p" | tee -a "$PATCH_LOG"
-                patch -p1 --dry-run -f -i "$p" 2>&1 | head -40 >> "$PATCH_LOG" || true
-              fi
-            done < <(find "$FEED_DIR/patches-feeds" -name "*.patch" | sort)
-          else
-            echo "INFO: no patches-feeds for 25.12"
-          fi
+          apply_patches "$PFEED_SRC" "patches-feeds"
 
           REJ=$(find . -name "*.rej" 2>/dev/null | wc -l)
           echo ""
           echo "=== Total .rej files: $REJ ==="
           if [ "$REJ" -gt 0 ]; then
-            echo "WARN: $REJ conflicts — see artifact: mtk-patch-log"
+            echo "WARN: $REJ conflicts — see artifact mtk-patch-log"
             find . -name "*.rej" 2>/dev/null >> "$PATCH_LOG"
           else
             echo "OK: All patches applied cleanly"
@@ -397,14 +407,14 @@ jobs:
             echo "   Соответствующие CONFIG_TARGET_DEVICE_* будут молча отброшены make defconfig."
             echo "   Проверьте вывод шага 'Diagnose Available Profiles'."
           fi
-          # НЕ exit 1 — сборка оставшихся устройств продолжится
 
       - name: Patch mtwifi-cfg-ucode (remove iwinfo-ucode dep, if present)
         run: |
           cd openwrt
           for cand in \
             "package/mtk/applications/mtwifi-cfg-ucode/Makefile" \
-            "package/mtk/mtwifi-cfg-ucode/Makefile"; do
+            "package/mtk/mtwifi-cfg-ucode/Makefile" \
+            "feeds/mtk_openwrt_feed/mtwifi-cfg-ucode/Makefile"; do
             if [ -f "$cand" ]; then
               echo "patching $cand"
               sed -i 's/+iwinfo-ucode//g' "$cand"

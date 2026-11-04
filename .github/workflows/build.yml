@@ -12,6 +12,7 @@ name: Build X-WRT for Routerich AX3000-V1 (+ optional others)
 #   8. apply_mtk_patches: применение mtk-openwrt-feeds (mtwifi/warp/hnat)
 #      Пути исправлены на официальные: feeds/mtk_openwrt_feed/25.12/...
 #      Логика патчей не падает при конфликтах (собирает .rej в лог).
+#      Бэкап Config.in делается только если файл существует (X-WRT).
 # ────────────────────────────────────────────────────────────────────
 
 on:
@@ -312,9 +313,14 @@ jobs:
             exit 1
           fi
 
-          # Бэкап Config.in (на случай если профили отвалятся)
-          echo "=== Backup Config.in ==="
-          cp -v target/linux/mediatek/image/Config.in /tmp/xwrt-Config.in.bak
+          # Бэкап Config.in (на случай если профили отвалятся) - только если файл есть
+          echo ""
+          echo "=== Backup Config.in (if exists) ==="
+          if [ -f target/linux/mediatek/image/Config.in ]; then
+            cp -v target/linux/mediatek/image/Config.in /tmp/xwrt-Config.in.bak
+          else
+            echo "INFO: original Config.in not found in X-WRT tree, skipping backup"
+          fi
 
           echo ""
           echo "=== Copy MTK files ==="

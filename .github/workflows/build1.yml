@@ -1,0 +1,626 @@
+name: Build X-WRT for Routerich AX3000-V1 (mt76 open drivers)
+
+# ─── Changelog ──────────────────────────────────────────────────────
+#   Чистая сборка X-WRT на открытых драйверах mt76 (APK).
+#   Удалены ВСЕ шаги, связанные с mtwifi и патчами MediaTek.
+#   - Нет apply_mtk_patches
+#   - Нет фида mtk_openwrt_feed
+#   - Нет Inject hanwckf mtwifi driver
+#   - Нет Apply MTK proprietary patches
+#   - Нет фикса fdt_add_pubkey
+#   Оставлены только Re:HomeProxy AutoMod и AmneziaWG.
+# ────────────────────────────────────────────────────────────────────
+
+on:
+  workflow_dispatch:
+    inputs:
+      base_repo:
+        description: 'База (4tomson = ваш форк, x-wrt = upstream)'
+        required: true
+        type: choice
+        default: '4tomson'
+        options:
+          - 4tomson
+          - x-wrt
+      base_branch:
+        description: 'Ветка (обычно master)'
+        required: true
+        type: string
+        default: 'master'
+      runner_type:
+        description: 'Где собирать?'
+        required: true
+        type: choice
+        default: 'self-hosted'
+        options:
+          - self-hosted
+          - ubuntu-22.04
+      build_amneziawg_only:
+        description: 'Собрать ТОЛЬКО AmneziaWG-пакеты'
+        type: boolean
+        default: false
+      force_clean:
+        description: 'ПОЛНАЯ ОЧИСТКА (build_dir, staging_dir, ccache, tmp)?'
+        type: boolean
+        default: false
+      clean_kernel:
+        description: 'Очистить только ядро?'
+        type: boolean
+        default: false
+      clean_packages:
+        description: 'Очистить собранные пакеты?'
+        type: boolean
+        default: false
+      clean_toolchain:
+        description: 'Очистить тулчейн и staging_dir (долго)?'
+        type: boolean
+        default: false
+      wipe_source:
+        description: 'Удалить openwrt и клонировать заново?'
+        type: boolean
+        default: false
+      skip_update:
+        description: 'Пропустить git pull?'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ${{ inputs.runner_type }}
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          clean: false
+
+      - name: Wipe Source (if requested)
+        if: ${{ inputs.wipe_source }}
+        run: |
+          rm -rf "$GITHUB_WORKSPACE/openwrt" 2>/dev/null || true
+          echo "OK: openwrt removed"
+
+      - name: Install Dependencies
+        run: |
+          MISSING=""
+          for pkg in build-essential clang flex bison g++ gawk gcc-multilib g++-multilib \
+                     gettext git libncurses-dev libssl-dev python3-setuptools python3-dev \
+                     swig rsync unzip zlib1g-dev file wget ccache patchutils squashfs-tools; do
+            dpkg -s "$pkg" >/dev/null 2>&1 || MISSING="$MISSING $pkg"
+          done
+          if [ -n "$MISSING" ]; then
+            sudo apt-get update
+            sudo apt-get -y install $MISSING
+          else
+            echo "OK: all deps installed"
+          fi
+
+      - name: Clone or Update Source
+        id: clone
+        run: |
+          cd "$GITHUB_WORKSPACE"
+          DL_CACHE="$RUNNER_WORKSPACE/dl-cache"
+          mkdir -p "$DL_CACHE"
+          echo "DL_CACHE=$DL_CACHE" >> $GITHUB_ENV
+
+          BASE="${{ inputs.base_repo }}"
+          BRANCH="${{ inputs.base_branch }}"
+          if [ "$BASE" = "4tomson" ]; then
+            REPO="https://github.com/4tomson/x-wrt.git"
+          else
+            REPO="https://github.com/x-wrt/x-wrt.git"
+          fi
+          echo "BASE=$BASE"      >> $GITHUB_ENV
+          echo "REPO=$REPO"      >> $GITHUB_ENV
+          echo "BRANCH=$BRANCH"  >> $GITHUB_ENV
+          echo "Selected base: $BASE ($REPO, branch: $BRANCH)"
+
+          if [ -d "openwrt" ] && [ -d "openwrt/.git" ]; then
+            CUR_REMOTE=$(cd openwrt && git remote get-url origin 2>/dev/null || echo "")
+            if [ "$CUR_REMOTE" != "$REPO" ]; then
+              echo "WARN: remote mismatch (current=$CUR_REMOTE, requested=$REPO)"
+              echo "WARN: wiping openwrt"
+              rm -rf openwrt
+            fi
+          fi
+
+          if [ -d "openwrt" ] && [ ! -f "openwrt/scripts/feeds" ]; then
+            echo "openwrt incomplete, removing"
+            rm -rf openwrt
+          fi
+
+          if [ ! -d "openwrt" ]; then
+            echo "cloning $BASE (branch: $BRANCH)"
+            git clone -b "$BRANCH" "$REPO" openwrt
+          elif [ "${{ inputs.skip_update }}" == "true" ]; then
+            echo "skip_update=true"
+          else
+            cd openwrt
+            CURRENT_BRANCH=$(git branch --show-current 2>/dev/null || echo "")
+            if [ "$CURRENT_BRANCH" != "$BRANCH" ]; then
+              echo "WARN: branch mismatch (current=$CURRENT_BRANCH, requested=$BRANCH)"
+              git fetch origin "$BRANCH" 2>/dev/null || true
+              git checkout "$BRANCH" 2>/dev/null || { echo "ERROR: cannot checkout $BRANCH"; exit 1; }
+            fi
+            git checkout -- . 2>/dev/null || true
+            git clean -fd feeds/ package/ toolchain/ target/ 2>/dev/null || true
+            git pull --rebase || echo "git pull failed, continuing"
+            cd "$GITHUB_WORKSPACE"
+          fi
+
+          if [ -d "openwrt/dl" ] && [ ! -L "openwrt/dl" ]; then
+            cp -rn openwrt/dl/. "$DL_CACHE/" 2>/dev/null || true
+            rm -rf openwrt/dl
+          fi
+          ln -sfn "$DL_CACHE" openwrt/dl
+
+          cd openwrt
+
+          # AmneziaWG external feed
+          if ! grep -q "awgopenwrt" feeds.conf.default; then
+            echo "src-git awgopenwrt https://github.com/this-username-has-been-taken/amneziawg-openwrt.git" >> feeds.conf.default
+          fi
+
+          ./scripts/feeds update -a
+          ./scripts/feeds install -a
+
+          echo "=== AmneziaWG packages in feeds ==="
+          ./scripts/feeds list 2>/dev/null | grep -Ei 'amnezia|awg' || echo "WARN: no amneziawg packages"
+
+          # Re:HomeProxy AutoMod из исходников
+          HP_PKG="$GITHUB_WORKSPACE/openwrt/package/luci-app-re-homeproxy"
+          if [ -d "$HP_PKG/.git" ]; then
+            echo "=== updating Re:HomeProxy AutoMod ==="
+            cd "$HP_PKG"
+            git fetch --depth 1 origin master 2>/dev/null || git fetch --depth 1 origin main 2>/dev/null || true
+            CUR=$(git branch --show-current 2>/dev/null || echo "master")
+            git reset --hard "origin/${CUR}" 2>/dev/null || git reset --hard HEAD
+            cd "$GITHUB_WORKSPACE/openwrt"
+          else
+            echo "=== cloning Re:HomeProxy AutoMod into package/ ==="
+            rm -rf "$HP_PKG"
+            git clone --depth 1 https://github.com/ezdizzy/Re-HomeProxy-AutoMod.git "$HP_PKG"
+          fi
+
+          if [ -f "$HP_PKG/Makefile" ] && grep -q 'include $(TOPDIR)/feeds/luci/luci.mk' "$HP_PKG/Makefile"; then
+            echo "OK: Re:HomeProxy Makefile is buildroot-compatible"
+            grep -E '^(PKG_NAME|PKG_VERSION|LUCI_PKGARCH)' "$HP_PKG/Makefile" | head -5
+          else
+            echo "ERROR: $HP_PKG/Makefile invalid"
+            ls -la "$HP_PKG" || true
+            exit 1
+          fi
+
+          rm -f package/feeds/luci/luci-app-re-homeproxy 2>/dev/null || true
+          rm -f package/feeds/luci/luci-app-re-homeproxy-hiddify 2>/dev/null || true
+          rm -f package/feeds/luci/luci-i18n-homeproxy-* 2>/dev/null || true
+          rm -f package/feeds/luci/luci-app-homeproxy* 2>/dev/null || true
+          ./scripts/feeds uninstall luci-app-re-homeproxy 2>/dev/null || true
+          ./scripts/feeds uninstall luci-i18n-homeproxy-ru 2>/dev/null || true
+
+          OPENWRT_REV=$(git rev-parse --short HEAD 2>/dev/null || echo "unknown")
+          echo "OPENWRT_REV=$OPENWRT_REV" >> $GITHUB_ENV
+          echo "openwrt_rev=$OPENWRT_REV" >> $GITHUB_OUTPUT
+          echo "OpenWrt base: $BASE @ $BRANCH @ $OPENWRT_REV"
+
+      - name: Diagnose Available Profiles (X-WRT tree)
+        run: |
+          cd openwrt
+          MK="target/linux/mediatek/image/filogic.mk"
+          echo "=== filogic.mk exists? ==="
+          ls -l "$MK" 2>/dev/null || { echo "ERROR: $MK missing — X-WRT may use another target layout"; exit 1; }
+
+          echo ""
+          echo "=== Available routerich/netis/xiaomi profiles ==="
+          grep -nE '^(define Device/(routerich|netis_nx32u|xiaomi_mi-router-ax3000t))' "$MK" || \
+            echo "WARN: none of the expected device profiles found"
+
+          echo ""
+          echo "=== DTS files for routerich in tree ==="
+          find target/linux/mediatek -name '*routerich*' 2>/dev/null || true
+
+          echo ""
+          echo "=== All mt7981 DTS ==="
+          ls target/linux/mediatek/dts/ 2>/dev/null | grep -i mt7981 || true
+
+      # --- Очистки ---
+      - name: Full Clean (if requested)
+        if: ${{ inputs.force_clean }}
+        run: |
+          cd openwrt
+          make dirclean >/dev/null 2>&1 || true
+          rm -rf build_dir staging_dir .ccache tmp logs
+          echo "OK: FULL clean"
+
+      - name: Clean Kernel Only (if requested)
+        if: ${{ inputs.clean_kernel && !inputs.force_clean }}
+        run: |
+          cd openwrt
+          make target/linux/clean
+          echo "OK: kernel clean"
+
+      - name: Clean Packages Only (if requested)
+        if: ${{ inputs.clean_packages && !inputs.force_clean }}
+        run: |
+          cd openwrt
+          make package/clean
+          echo "OK: packages clean"
+
+      - name: Clean Toolchain Only (if requested)
+        if: ${{ inputs.clean_toolchain && !inputs.force_clean }}
+        run: |
+          cd openwrt
+          rm -rf staging_dir toolchain
+          echo "OK: toolchain clean"
+
+      - name: Check filogic.mk (mt76 packages should be present)
+        run: |
+          cd openwrt
+          MK="target/linux/mediatek/image/filogic.mk"
+          [ -f "$MK" ] || { echo "ERROR: $MK not found"; exit 1; }
+
+          for dev in netis_nx32u routerich_ax3000-v1 routerich_ax3000 xiaomi_mi-router-ax3000t; do
+            echo "=== $dev DEVICE_PACKAGES ==="
+            awk "/^define Device\\/$dev\$/,/^endef/" "$MK" | grep -E 'DEVICE_PACKAGES' || echo "  (profile not found or no packages)"
+          done
+
+      - name: Check Device Profiles (WARN, not error)
+        run: |
+          cd openwrt
+          MK="target/linux/mediatek/image/filogic.mk"
+          MISSING=""
+          for dev in netis_nx32u routerich_ax3000-v1 routerich_ax3000 xiaomi_mi-router-ax3000t; do
+            if grep -q "Device/$dev" "$MK"; then
+              echo "OK: $dev present"
+            else
+              echo "WARN: $dev MISSING in $MK"
+              MISSING="$MISSING $dev"
+            fi
+          done
+          if [ -n "$MISSING" ]; then
+            echo ""
+            echo "WARN: Missing profiles:$MISSING"
+            echo "   Соответствующие CONFIG_TARGET_DEVICE_* будут молча отброшены make defconfig."
+          fi
+
+      # Кеши
+      - name: Restore ccache
+        uses: actions/cache/restore@v4
+        if: inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ inputs.base_repo }}-${{ github.sha }}
+          restore-keys: |
+            ccache-${{ inputs.base_repo }}-
+            ccache-
+
+      - name: Restore build_dir
+        uses: actions/cache/restore@v4
+        if: inputs.runner_type == 'ubuntu-22.04' && !inputs.force_clean && !inputs.clean_kernel
+        with:
+          path: openwrt/build_dir
+          key: build-${{ inputs.base_repo }}-${{ github.sha }}
+          restore-keys: |
+            build-${{ inputs.base_repo }}-
+            build-
+
+      - name: Restore staging_dir
+        uses: actions/cache/restore@v4
+        if: inputs.runner_type == 'ubuntu-22.04' && !inputs.force_clean && !inputs.clean_toolchain
+        with:
+          path: openwrt/staging_dir
+          key: staging-${{ inputs.base_repo }}-${{ github.sha }}
+          restore-keys: |
+            staging-${{ inputs.base_repo }}-
+            staging-
+
+      - name: Restore dl-cache
+        uses: actions/cache/restore@v4
+        if: inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: ${{ runner.workspace }}/dl-cache
+          key: dl-${{ inputs.base_repo }}-${{ steps.clone.outputs.openwrt_rev || github.sha }}
+          restore-keys: dl-${{ inputs.base_repo }}-
+
+      - name: Apply Config
+        run: |
+          cp "$GITHUB_WORKSPACE/config/xwrt-routerich-mt76.config" openwrt/.config
+          cd openwrt
+
+          # WireGuard → AmneziaWG
+          sed -i 's/^CONFIG_PACKAGE_kmod-wireguard=y/# CONFIG_PACKAGE_kmod-wireguard is not set/' .config
+          grep -q '^# CONFIG_PACKAGE_kmod-wireguard is not set' .config || \
+            echo '# CONFIG_PACKAGE_kmod-wireguard is not set' >> .config
+          for pkg in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=y" .config || echo "CONFIG_PACKAGE_${pkg}=y" >> .config
+          done
+
+          make defconfig
+
+          echo ""
+          echo "=== Selected device profiles (after defconfig) ==="
+          for dev in netis_nx32u routerich_ax3000-v1 routerich_ax3000 xiaomi_mi-router-ax3000t; do
+            if grep -q "CONFIG_TARGET_DEVICE_mediatek_filogic_DEVICE_${dev}=y" .config; then
+              echo "OK: $dev"
+            else
+              echo "WARN: $dev NOT selected (profile absent in this fork)"
+            fi
+          done
+
+          echo ""
+          echo "=== Open Wi-Fi (mt76) packages ==="
+          for pkg in kmod-mt7915e kmod-mt7981-firmware mt7981-wo-firmware kmod-mt76-core kmod-mt76-connac; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "OK: $pkg" || echo "MISSING: $pkg"
+          done
+
+          echo ""
+          echo "=== kmod state (=m or =y) ==="
+          for pkg in kmod-nft-tproxy kmod-tun kmod-nft-socket kmod-inet-diag kmod-netlink-diag kmod-nft-fullcone; do
+            if grep -qE "^CONFIG_PACKAGE_${pkg}=[my]$" .config; then
+              STATE=$(grep -E "^CONFIG_PACKAGE_${pkg}=" .config | head -1 | cut -d= -f2)
+              echo "OK: $pkg=$STATE"
+            else
+              echo "MISSING: $pkg"
+            fi
+          done
+
+          echo ""
+          echo "=== AmneziaWG ==="
+          for pkg in kmod-amneziawg amneziawg-tools luci-proto-amneziawg; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "OK: $pkg" || echo "MISSING: $pkg"
+          done
+          grep -q "^CONFIG_PACKAGE_kmod-wireguard=y" .config \
+            && echo "WARN: kmod-wireguard still enabled" \
+            || echo "OK: kmod-wireguard disabled"
+
+          echo ""
+          echo "=== Re:HomeProxy (essential) ==="
+          for pkg in luci-app-re-homeproxy ucode-mod-digest firewall4; do
+            grep -q "^CONFIG_PACKAGE_${pkg}=y" .config && echo "OK: $pkg" || { echo "MISSING: $pkg"; exit 1; }
+          done
+
+          echo ""
+          echo "=== Re:HomeProxy i18n (optional) ==="
+          I18N=""
+          for cand in luci-i18n-re-homeproxy-ru luci-i18n-homeproxy-ru; do
+            grep -q "^CONFIG_PACKAGE_${cand}=y" .config && { I18N="$cand"; break; }
+          done
+          [ -n "$I18N" ] && echo "OK: $I18N" || echo "INFO: ru i18n not in config (optional)"
+
+      - name: Download Packages
+        run: |
+          cd openwrt
+          make download -j8
+
+      - name: Compile AmneziaWG Only
+        if: ${{ inputs.build_amneziawg_only }}
+        run: |
+          cd openwrt
+          rm -rf tmp
+          echo "=== Building AmneziaWG packages only ==="
+          build_awg() {
+            make package/feeds/awgopenwrt/kmod-amneziawg/compile V=s \
+              && make package/feeds/awgopenwrt/amneziawg-tools/compile V=s \
+              && make package/feeds/awgopenwrt/luci-proto-amneziawg/compile V=s
+          }
+          if build_awg; then
+            echo "=== Attempt 1 OK ==="
+          else
+            echo "=== Attempt 1 failed → toolchain+headers ==="
+            if make tools/install toolchain/install target/linux/compile -j$(nproc) V=s && build_awg; then
+              echo "=== Attempt 2 OK ==="
+            else
+              echo "=== Attempt 2 failed → full build ==="
+              make -j$(nproc) || make -j1 V=s || true
+              build_awg
+            fi
+          fi
+
+          echo "=== Built AmneziaWG packages ==="
+          find bin/packages \( -name "*amnezia*" -o -name "*awg*" \) | sort
+          if ! find bin/packages \( -name "*kmod-amneziawg*.apk" -o -name "*kmod-amneziawg*.ipk" \) | grep -q .; then
+            echo "ERROR: kmod-amneziawg not built"
+            exit 1
+          fi
+
+      - name: Compile Firmware
+        if: ${{ !inputs.build_amneziawg_only }}
+        run: |
+          cd openwrt
+          rm -rf tmp
+          make -j$(nproc) || make -j1 V=s
+          echo "=== Built images ==="
+          ls -lh bin/targets/mediatek/filogic/*.bin bin/targets/mediatek/filogic/*.itb bin/targets/mediatek/filogic/*.ubi 2>/dev/null || {
+            echo "ERROR: no images found"; exit 1
+          }
+
+      - name: Validate firmware (non-blocking)
+        if: success() && !inputs.build_amneziawg_only
+        continue-on-error: true
+        run: |
+          cd openwrt
+          echo "=== Image sizes ==="
+          for img in bin/targets/mediatek/filogic/*.bin bin/targets/mediatek/filogic/*.itb bin/targets/mediatek/filogic/*.ubi; do
+            [ -f "$img" ] || continue
+            SIZE=$(stat -c%s "$img"); SIZE_MB=$((SIZE/1024/1024))
+            echo "$(basename $img): ${SIZE_MB} MB"
+            [ "$SIZE" -lt 5000000 ] && echo "WARN: $img suspiciously small"
+          done
+
+          if command -v unsquashfs >/dev/null 2>&1; then
+            for img in bin/targets/mediatek/filogic/*squashfs-sysupgrade.bin; do
+              [ -f "$img" ] || continue
+              echo ""
+              echo "=== contents: $(basename $img) ==="
+              L=$(unsquashfs -l "$img" 2>/dev/null)
+              for pat in \
+                "amneziawg.ko" \
+                "usr/share/luci/menu.d/luci-app-re-homeproxy.json" \
+                "usr/share/rpcd/ucode/luci.homeproxy" \
+                "etc/init.d/homeproxy"; do
+                printf '%s' "$L" | grep -q "$pat" && echo "OK: $pat" || echo "WARN: $pat missing"
+              done
+            done
+          fi
+
+          echo ""
+          echo "=== Re:HomeProxy packages in bin/packages ==="
+          find bin/packages \( -name "luci-app-re-homeproxy*.apk" -o -name "luci-app-re-homeproxy*.ipk" \) -exec ls -lh {} \; || echo "none"
+
+      - name: Record build-info.txt
+        if: success()
+        run: |
+          cd openwrt
+          KVER=$(cat build_dir/target-*/linux-mediatek_filogic/linux-*/include/config/kernel.release 2>/dev/null | head -1 || echo "unknown")
+          VMOD=$(find build_dir/target-*/linux-mediatek_filogic -name 'amneziawg.ko' 2>/dev/null | head -1)
+          if [ -n "$VMOD" ]; then
+            VERMAGIC=$(strings "$VMOD" | grep -m1 '^vermagic=' | sed 's/^vermagic=//' || echo "unknown")
+          else
+            VERMAGIC="kmod not built"
+          fi
+          HOMEPROXY_VER=$(cd package/luci-app-re-homeproxy 2>/dev/null && git describe --tags --always 2>/dev/null || echo "unknown")
+          cat > build-info.txt <<EOF
+          X-WRT build info (mt76 open drivers)
+          ===================================
+          Base:      ${{ inputs.base_repo }}
+          Branch:    ${{ inputs.base_branch }}
+          Commit:    $(git log -1 --format=%H 2>/dev/null || echo "unknown")
+          Kernel:    ${KVER}
+          Vermagic:  ${VERMAGIC}
+          Built at:  $(date -u +%Y-%m-%dT%H:%M:%SZ)
+          Mode:      ${{ inputs.build_amneziawg_only && 'AmneziaWG only' || 'Full firmware' }}
+          Wi-Fi:     mt76 (open source)
+          HomeProxy: ${HOMEPROXY_VER}
+
+          Post-flash notes
+          ================
+          1. Re:HomeProxy AutoMod (ezdizzy) уже в образе.
+             LuCI → Services → Re:HomeProxy AutoMod.
+
+          2. Ядро прокси (hiddify / sing-box), Zapret, ByeDPI, mosdns
+             ставятся через install.sh:
+               wget -qO- https://raw.githubusercontent.com/ezdizzy/re-homeproxy/master/install.sh | sh
+
+          3. Для AWG на lite-сборке (kernel WG быстрее gvisor):
+               uci set 'homeproxy.@node[N].wireguard_backend=system'
+               uci commit homeproxy && /etc/init.d/homeproxy restart
+
+          4. ВНИМАНИЕ: разметка UBI 112 МБ. Если устройство было на 112 МБ
+             ещё до прошивки — используйте sysupgrade. Если нет —
+             сначала миграция разметки через U-Boot (см. документацию Routerich).
+
+          5. Xiaomi AX3000T — только ранние ревизии на MT7981 (RD03 V1).
+             НЕ прошивать на Qualcomm-ревизиях!
+
+          6. Wi-Fi драйвер: открытый mt76. Проприетарный mtwifi НЕ используется.
+             Функционал стандартный для OpenWrt/X-WRT.
+          EOF
+          echo "=== build-info.txt ==="
+          cat build-info.txt
+          cp build-info.txt bin/ 2>/dev/null || true
+
+      - name: Save ccache
+        uses: actions/cache/save@v4
+        if: always() && inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: openwrt/.ccache
+          key: ccache-${{ inputs.base_repo }}-${{ github.sha }}
+
+      - name: Save build_dir
+        uses: actions/cache/save@v4
+        if: always() && inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: openwrt/build_dir
+          key: build-${{ inputs.base_repo }}-${{ github.sha }}
+
+      - name: Save staging_dir
+        uses: actions/cache/save@v4
+        if: always() && inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: openwrt/staging_dir
+          key: staging-${{ inputs.base_repo }}-${{ github.sha }}
+
+      - name: Save dl-cache
+        uses: actions/cache/save@v4
+        if: always() && inputs.runner_type == 'ubuntu-22.04'
+        with:
+          path: ${{ runner.workspace }}/dl-cache
+          key: dl-${{ inputs.base_repo }}-${{ steps.clone.outputs.openwrt_rev || github.sha }}
+
+      - name: Upload AmneziaWG Packages
+        if: success() && inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: amneziawg-packages
+          path: |
+            openwrt/bin/packages/**/*amnezia*.apk
+            openwrt/bin/packages/**/*amnezia*.ipk
+            openwrt/bin/packages/**/*awg*.apk
+            openwrt/bin/packages/**/*awg*.ipk
+            openwrt/build-info.txt
+          if-no-files-found: error
+
+      - name: Upload Packages (common)
+        if: success() && !inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: packages-all
+          path: openwrt/bin/packages/
+          if-no-files-found: warn
+
+      - name: Upload Artifacts for Netis NX32U
+        if: success() && !inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-netis-nx32u
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*nx32u*
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/build-info.txt
+          if-no-files-found: warn
+
+      - name: Upload Artifacts for Routerich AX3000-V1
+        if: success() && !inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-routerich-ax3000-v1
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*routerich_ax3000-v1*
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/build-info.txt
+          if-no-files-found: warn
+
+      - name: Upload Artifacts for Routerich AX3000 (non-v1)
+        if: success() && !inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-routerich-ax3000
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*routerich_ax3000-squashfs*
+            openwrt/bin/targets/mediatek/filogic/*routerich_ax3000-initramfs*
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/build-info.txt
+          if-no-files-found: warn
+
+      - name: Upload Artifacts for Xiaomi Mi Router AX3000T
+        if: success() && !inputs.build_amneziawg_only
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-xiaomi-ax3000t
+          path: |
+            openwrt/bin/targets/mediatek/filogic/*xiaomi_mi-router-ax3000t*
+            openwrt/bin/targets/mediatek/filogic/sha256sums
+            openwrt/build-info.txt
+          if-no-files-found: warn
+
+      - name: Upload Build Logs on Failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-logs-failure
+          path: |
+            openwrt/logs/
+            openwrt/tmp/
+            openwrt/.config
+            openwrt/bin/
+          if-no-files-found: ignore
